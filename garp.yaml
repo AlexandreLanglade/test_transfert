@@ -1,0 +1,54 @@
+---
+- name: Send Gratuitous ARP on Arista Switches
+  hosts: switches
+  gather_facts: false
+  vars:
+    # Liste des VLANs à traiter (peut être passée en extra-vars)
+    target_vlans: [10, 20, 21, 22]
+
+  tasks:
+    - name: Get Virtual Router MAC address
+      arista.eos.eos_command:
+        commands:
+          - command: show ip virtual-router | json
+      register: vrouter_output
+
+    - name: Fail if no virtual MAC is configured
+      fail:
+        msg: "No virtual MAC address configured on {{ inventory_hostname }}"
+      when: vrouter_output.stdout[0].virtualMac == "00:00:00:00:00:00"
+
+    - name: Set Virtual MAC variable
+      set_fact:
+        virtual_mac: "{{ vrouter_output.stdout[0].virtualMac }}"
+
+    - name: Get IP interface details
+      arista.eos.eos_command:
+        commands:
+          - command: "show ip interface vlan {{ item }} | json"
+      loop: "{{ target_vlans }}"
+      register: interface_outputs
+      ignore_errors: true
+
+    - name: Send GARP via ethxmit
+      arista.eos.eos_command:
+        commands:
+          - command: >
+              {% set iface_data = item.stdout[0].interfaces['Vlan' ~ item.item] %}
+              {% set vip = iface_data.interfaceAddress.virtualIp.address %}
+              {% set vrf = iface_data.vrf %}
+              {% if vrf == 'default' %}
+                bash timeout 5 sudo ethxmit --ip-src={{ vip }} --ip-dst={{ vip }} -S {{ virtual_mac }} --arp=reply vlan{{ item.item }}
+              {% else %}
+                bash timeout 5 sudo ip netns exec ns-{{ vrf }} ethxmit --ip-src={{ vip }} --ip-dst={{ vip }} -S {{ virtual_mac }} --arp=reply vlan{{ item.item }}
+              {% endif %}
+      loop: "{{ interface_outputs.results }}"
+      when: 
+        - item.failed == false
+        - item.stdout[0].interfaces['Vlan' ~ item.item].interfaceAddress.virtualIp.address != "0.0.0.0"
+      loop_control:
+        label: "Sending GARP for Vlan{{ item.item }}"
+
+    - name: Confirm completion
+      debug:
+        msg: "GARP execution finished for all valid SVIs on {{ inventory_hostname }}"
